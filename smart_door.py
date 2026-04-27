@@ -2,13 +2,18 @@ import requests
 import time
 import os
 import threading
+import tempfile
 import cv2
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv('config.env')
 API_URL      = os.getenv('API_URL', 'http://127.0.0.1:8000/api/door/unlock')
 DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', 'raspi-token-001')
 SIMULATE     = os.getenv('SIMULATE', 'true').lower() == 'true'
+
+TELEGRAM_TOKEN   = '8689794607:AAH-qZm2pPEuJTsodxHoQO8Xi3lpXItcs9I'
+TELEGRAM_CHAT_ID = '5438873362'
 
 # ── GPIO ──────────────────────────────────────────
 class GPIOSimulator:
@@ -36,8 +41,25 @@ USER_NAMES = {
     1: 'hardi',
 }
 
+# ── Telegram ──────────────────────────────────────
+def send_telegram_photo(frame, caption):
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+        cv2.imwrite(tmp.name, frame)
+        tmp.close()
+        url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto'
+        with open(tmp.name, 'rb') as photo:
+            requests.post(url, data={
+                'chat_id'    : TELEGRAM_CHAT_ID,
+                'caption'    : caption,
+                'parse_mode' : 'HTML',
+            }, files={'photo': photo}, timeout=10)
+        os.unlink(tmp.name)
+    except Exception as e:
+        print(f'[TELEGRAM ERROR] {e}')
+
 # ── API ───────────────────────────────────────────
-def check_access(identifier, method='rfid'):
+def check_access(identifier, method='rfid', frame=None):
     print(f"\n[API] Kirim request → {identifier} ({method})")
     try:
         res  = requests.post(API_URL, json={
@@ -45,14 +67,36 @@ def check_access(identifier, method='rfid'):
             'identifier':   identifier,
             'method':       method,
         }, timeout=5)
-        data = res.json()
-        if data.get('status') == 'granted':
+        data   = res.json()
+        status = data.get('status')
+        waktu  = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+
+        if status == 'granted':
             print(f"[✅ GRANTED] {data['message']}")
             buka_pintu()
+            if frame is not None:
+                caption = (f"✅ <b>AKSES DITERIMA</b>\n\n"
+                          f"🚪 Pintu berhasil dibuka\n"
+                          f"📅 Waktu     : {waktu}\n"
+                          f"🔑 Identifier: {identifier}\n"
+                          f"📡 Metode    : {method.upper()}")
+                threading.Thread(target=send_telegram_photo,
+                                 args=(frame.copy(), caption), daemon=True).start()
         else:
             print(f"[❌ DENIED]  {data['message']}")
             tolak_akses()
-        return data.get('status') == 'granted'
+            if frame is not None:
+                reason = data.get('reason', 'Tidak diketahui')
+                caption = (f"🚨 <b>PERINGATAN SMART DOOR</b>\n\n"
+                          f"❌ <b>Akses Ditolak!</b>\n"
+                          f"📅 Waktu     : {waktu}\n"
+                          f"🔑 Identifier: {identifier}\n"
+                          f"📡 Metode    : {method.upper()}\n"
+                          f"⚠️ Alasan    : {reason}")
+                threading.Thread(target=send_telegram_photo,
+                                 args=(frame.copy(), caption), daemon=True).start()
+
+        return status == 'granted'
     except requests.exceptions.ConnectionError:
         print("[ERROR] Laravel tidak jalan! Jalankan: php artisan serve")
     except Exception as e:
@@ -97,7 +141,7 @@ def face_recognition_thread():
 
     last_sent   = {}
     frame_count = 0
-    COOLDOWN    = 60  # ~2 detik @ 30fps, cegah spam API
+    COOLDOWN    = 60
 
     while True:
         ret, frame = cap.read()
@@ -109,29 +153,33 @@ def face_recognition_thread():
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
         for (x, y, w, h) in faces:
-            face_roi           = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
-            label, confidence  = recognizer.predict(face_roi)
+            face_roi          = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+            label, confidence = recognizer.predict(face_roi)
 
             if confidence < 70:
-                name   = USER_NAMES.get(label, f'User {label}')
-                color  = (0, 255, 0)
-                status = f'{name} ({confidence:.0f})'
-
-                if frame_count - last_sent.get(label, -COOLDOWN) >= COOLDOWN:
-                    last_sent[label] = frame_count
-                    print(f"\n[FACE] Wajah dikenali: {name} (confidence: {confidence:.1f})")
-                    threading.Thread(
-                        target=check_access,
-                        args=(f'FACE-user_{label}', 'face'),
-                        daemon=True
-                    ).start()
+                name       = USER_NAMES.get(label, f'User {label}')
+                identifier = f'FACE-user_{label}'
+                color      = (0, 255, 0)
+                status     = f'{name} ({confidence:.0f})'
             else:
-                color  = (0, 0, 255)
-                status = f'Tidak dikenal ({confidence:.0f})'
+                name       = 'Tidak dikenal'
+                identifier = 'FACE-UNKNOWN'
+                color      = (0, 0, 255)
+                status     = f'Tidak dikenal ({confidence:.0f})'
 
             cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
             cv2.putText(frame, status, (x, y-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            key = identifier
+            if frame_count - last_sent.get(key, -COOLDOWN) >= COOLDOWN:
+                last_sent[key] = frame_count
+                print(f"\n[FACE] Terdeteksi: {name} (confidence: {confidence:.1f})")
+                threading.Thread(
+                    target=check_access,
+                    args=(identifier, 'face', frame.copy()),
+                    daemon=True
+                ).start()
 
         cv2.putText(frame, "Smart Door — Face Recognition",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 229, 122), 2)
@@ -172,11 +220,9 @@ def manual_input_thread():
 
 # ── Main ──────────────────────────────────────────
 if __name__ == "__main__":
-    # Jalankan face recognition di background
     t = threading.Thread(target=face_recognition_thread, daemon=True)
     t.start()
 
-    # Manual input di main thread
     manual_input_thread()
 
     GPIO.cleanup()
