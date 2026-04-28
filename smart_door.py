@@ -39,10 +39,11 @@ MODEL_PATH = os.path.join(BASE_DIR, 'models', 'face_recognition', 'face_model.ym
 
 USER_NAMES = {
     1: 'hardi',
+    2: 'andi',
 }
 
-MAX_DENIED_NOTIF = 3  # maksimal notif denied per sesi
-ACCESS_GRANTED   = threading.Event()  # flag global jika sudah ada yang granted
+MAX_DENIED_NOTIF = 3
+ACCESS_GRANTED   = threading.Event()
 
 # ── Telegram ──────────────────────────────────────
 def send_telegram_photo(frame, caption):
@@ -143,8 +144,8 @@ def face_recognition_thread():
     print("[FACE] Webcam aktif — face recognition berjalan.")
 
     last_sent     = {}
-    notif_granted = {}  # {label: True} jika sudah kirim notif granted
-    notif_denied  = 0   # jumlah notif denied terkirim (global)
+    notif_granted = {}
+    notif_denied  = 0
     frame_count   = 0
     COOLDOWN      = 60
 
@@ -171,7 +172,6 @@ def face_recognition_thread():
                     last_sent[identifier] = frame_count
 
                     if not notif_granted.get(label, False):
-                        # Set granted flag — block semua denied notif
                         notif_granted[label] = True
                         notif_denied = MAX_DENIED_NOTIF  # block denied
                         ACCESS_GRANTED.set()
@@ -193,7 +193,6 @@ def face_recognition_thread():
                 if frame_count - last_sent.get(identifier, -COOLDOWN) >= COOLDOWN:
                     last_sent[identifier] = frame_count
 
-                    # Jika sudah ada yang granted, jangan kirim denied
                     if ACCESS_GRANTED.is_set():
                         print(f"\n[FACE] Tidak dikenal — diabaikan (sudah ada akses granted).")
                     elif notif_denied < MAX_DENIED_NOTIF:
