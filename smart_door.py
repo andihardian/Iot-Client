@@ -12,8 +12,8 @@ API_URL      = os.getenv('API_URL', 'http://127.0.0.1:8000/api/door/unlock')
 DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', 'raspi-token-001')
 SIMULATE     = os.getenv('SIMULATE', 'true').lower() == 'true'
 
-TELEGRAM_TOKEN   = '8689794607:AAH-qZm2pPEuJTsodxHoQO8Xi3lpXItcs9I'
-TELEGRAM_CHAT_ID = '5438873362'
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '8689794607:AAH-qZm2pPEuJTsodxHoQO8Xi3lpXItcs9I')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '5438873362')
 
 # ── GPIO ──────────────────────────────────────────
 class GPIOSimulator:
@@ -40,6 +40,9 @@ MODEL_PATH = os.path.join(BASE_DIR, 'models', 'face_recognition', 'face_model.ym
 USER_NAMES = {
     1: 'hardi',
 }
+
+MAX_DENIED_NOTIF = 3  # maksimal notif denied per sesi
+ACCESS_GRANTED   = threading.Event()  # flag global jika sudah ada yang granted
 
 # ── Telegram ──────────────────────────────────────
 def send_telegram_photo(frame, caption):
@@ -86,7 +89,7 @@ def check_access(identifier, method='rfid', frame=None):
             print(f"[❌ DENIED]  {data['message']}")
             tolak_akses()
             if frame is not None:
-                reason = data.get('reason', 'Tidak diketahui')
+                reason = data.get('reason', data.get('message', 'Tidak diketahui'))
                 caption = (f"🚨 <b>PERINGATAN SMART DOOR</b>\n\n"
                           f"❌ <b>Akses Ditolak!</b>\n"
                           f"📅 Waktu     : {waktu}\n"
@@ -139,9 +142,11 @@ def face_recognition_thread():
 
     print("[FACE] Webcam aktif — face recognition berjalan.")
 
-    last_sent   = {}
-    frame_count = 0
-    COOLDOWN    = 60
+    last_sent     = {}
+    notif_granted = {}  # {label: True} jika sudah kirim notif granted
+    notif_denied  = 0   # jumlah notif denied terkirim (global)
+    frame_count   = 0
+    COOLDOWN      = 60
 
     while True:
         ret, frame = cap.read()
@@ -161,25 +166,50 @@ def face_recognition_thread():
                 identifier = f'FACE-user_{label}'
                 color      = (0, 255, 0)
                 status     = f'{name} ({confidence:.0f})'
+
+                if frame_count - last_sent.get(identifier, -COOLDOWN) >= COOLDOWN:
+                    last_sent[identifier] = frame_count
+
+                    if not notif_granted.get(label, False):
+                        # Set granted flag — block semua denied notif
+                        notif_granted[label] = True
+                        notif_denied = MAX_DENIED_NOTIF  # block denied
+                        ACCESS_GRANTED.set()
+                        print(f"\n[FACE] Terdeteksi: {name} (confidence: {confidence:.1f}) → notif dikirim")
+                        threading.Thread(
+                            target=check_access,
+                            args=(identifier, 'face', frame.copy()),
+                            daemon=True
+                        ).start()
+                    else:
+                        print(f"\n[FACE] {name} sudah granted — notif tidak dikirim lagi.")
+
             else:
                 name       = 'Tidak dikenal'
                 identifier = 'FACE-UNKNOWN'
                 color      = (0, 0, 255)
                 status     = f'Tidak dikenal ({confidence:.0f})'
 
+                if frame_count - last_sent.get(identifier, -COOLDOWN) >= COOLDOWN:
+                    last_sent[identifier] = frame_count
+
+                    # Jika sudah ada yang granted, jangan kirim denied
+                    if ACCESS_GRANTED.is_set():
+                        print(f"\n[FACE] Tidak dikenal — diabaikan (sudah ada akses granted).")
+                    elif notif_denied < MAX_DENIED_NOTIF:
+                        notif_denied += 1
+                        print(f"\n[FACE] Tidak dikenal — notif {notif_denied}/{MAX_DENIED_NOTIF}")
+                        threading.Thread(
+                            target=check_access,
+                            args=(identifier, 'face', frame.copy()),
+                            daemon=True
+                        ).start()
+                    else:
+                        print(f"\n[FACE] Tidak dikenal — notif sudah maksimal ({MAX_DENIED_NOTIF}x), diabaikan.")
+
             cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
             cv2.putText(frame, status, (x, y-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-            key = identifier
-            if frame_count - last_sent.get(key, -COOLDOWN) >= COOLDOWN:
-                last_sent[key] = frame_count
-                print(f"\n[FACE] Terdeteksi: {name} (confidence: {confidence:.1f})")
-                threading.Thread(
-                    target=check_access,
-                    args=(identifier, 'face', frame.copy()),
-                    daemon=True
-                ).start()
 
         cv2.putText(frame, "Smart Door — Face Recognition",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 229, 122), 2)

@@ -1,131 +1,192 @@
 import cv2
-import requests
 import os
-import json
+import sys
+import requests
+import threading
+import tempfile
 import time
 from dotenv import load_dotenv
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, '..', 'config.env'))
+# Load konfigurasi dari config.env
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.env'))
 
-API_URL              = os.getenv('API_URL', 'http://127.0.0.1:8000/api/door/unlock')
-DEVICE_TOKEN         = os.getenv('DEVICE_TOKEN', 'raspi-token-001')
-CONFIDENCE_THRESHOLD = 60
-COOLDOWN_SECONDS     = 5
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+HAAR       = os.path.join(BASE_DIR, '..', 'haarcascade', 'haarcascade_frontalface_default.xml')
+MODEL_PATH = os.path.join(BASE_DIR, '..', 'models', 'face_recognition', 'face_model.yml')
 
-HAAR        = os.path.join(BASE_DIR, '..', 'haarcascade', 'haarcascade_frontalface_default.xml')
-MODEL_PATH  = os.path.join(BASE_DIR, '..', 'models', 'face_model.yml')
-LABELS_PATH = os.path.join(BASE_DIR, '..', 'models', 'labels.json')
+API_URL      = os.getenv('API_URL', 'http://127.0.0.1:8000/api/door/unlock')
+API_BASE     = API_URL.replace('/api/door/unlock', '')
+DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', 'raspi-token-001')
 
-class FaceDetector:
-    def __init__(self):
-        self.face_cascade = cv2.CascadeClassifier(HAAR)
-        if self.face_cascade.empty():
-            raise FileNotFoundError(f"Haarcascade tidak ditemukan: {HAAR}")
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError("Model belum ada! Jalankan train_model.py dulu.")
+# ── Fetch USER_NAMES dari Laravel ─────────────────
+USER_NAMES      = {}
+USER_NAMES_LOCK = threading.Lock()
 
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
-        self.recognizer.load(MODEL_PATH)
-
-        with open(LABELS_PATH) as f:
-            self.labels = json.load(f)
-
-        self.last_sent = 0
-        print("[✅] Face Detector siap!")
-        print(f"[INFO] User terdaftar : {list(self.labels.values())}")
-        print(f"[INFO] Threshold      : {CONFIDENCE_THRESHOLD}")
-        print(f"[INFO] Cooldown       : {COOLDOWN_SECONDS}s")
-
-    def send_api(self, identifier):
-        now = time.time()
-        if now - self.last_sent < COOLDOWN_SECONDS:
-            return None
-        try:
-            res = requests.post(API_URL, json={
-                "device_token": DEVICE_TOKEN,
-                "identifier":   identifier,
-                "method":       "face",
-            }, timeout=5)
-            self.last_sent = now
-            return res.json()
-        except requests.exceptions.ConnectionError:
-            print("[ERROR] Laravel tidak jalan!")
-            return None
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            return None
-
-    def draw_ui(self, frame, x, y, w, h, name, conf_pct, is_known):
-        color = (0, 220, 80) if is_known else (0, 0, 220)
-        label = f"{name}  {conf_pct}%" if is_known else f"Unknown  {conf_pct}%"
-
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-        cv2.rectangle(frame, (x, y-36), (x+w, y), color, -1)
-        cv2.putText(frame, label, (x+5, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-        status = "GRANTED — Pintu Terbuka" if is_known else "DENIED — Akses Ditolak"
-        cv2.rectangle(frame, (x, y+h), (x+w, y+h+28), color, -1)
-        cv2.putText(frame, status, (x+5, y+h+20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-
-    def run(self):
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("[ERROR] Webcam tidak bisa dibuka!")
-            return
-
-        print("\n[READY] Face Recognition aktif — tekan 'q' untuk keluar\n")
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = self.face_cascade.detectMultiScale(
-                gray, scaleFactor=1.3, minNeighbors=5, minSize=(80, 80)
-            )
-
-            for (x, y, w, h) in faces:
-                face_roi       = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
-                label_id, conf = self.recognizer.predict(face_roi)
-                is_known       = conf < CONFIDENCE_THRESHOLD
-                conf_pct       = max(0, 100 - int(conf))
-                user_label     = self.labels.get(str(label_id), "Unknown")
-                identifier     = f"FACE-{user_label}" if is_known else "FACE-UNKNOWN"
-
-                self.draw_ui(frame, x, y, w, h, user_label, conf_pct, is_known)
-
-                result = self.send_api(identifier)
-                if result:
-                    if result.get('status') == 'granted':
-                        print(f"[✅ GRANTED] {user_label} — {conf_pct}% confidence")
-                    elif result.get('status') == 'denied':
-                        print(f"[❌ DENIED]  Wajah tidak dikenal — {conf_pct}%")
-
-            # Header
-            cv2.rectangle(frame, (0, 0), (frame.shape[1], 62), (15, 15, 20), -1)
-            cv2.putText(frame, "SMART DOOR — Face Recognition",
-                        (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 229, 122), 2)
-            cv2.putText(frame, f"Detected: {len(faces)} face(s) | 'q' to quit",
-                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
-
-            cv2.imshow("Smart Door — Face Recognition", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        cap.release()
-        cv2.destroyAllWindows()
-        print("\n[EXIT] Face Detector selesai")
-
-if __name__ == "__main__":
+def fetch_user_names():
+    """Fetch daftar nama user dari Laravel API"""
+    global USER_NAMES
     try:
-        detector = FaceDetector()
-        detector.run()
-    except FileNotFoundError as e:
-        print(f"\n[ERROR] {e}")
-    except KeyboardInterrupt:
-        print("\n[EXIT] Dihentikan")
+        res = requests.get(f'{API_BASE}/api/users/identifiers', timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            # Convert key dari string ke int: {"1": "hardi"} → {1: "hardi"}
+            with USER_NAMES_LOCK:
+                USER_NAMES = {int(k): v for k, v in data.items()}
+            print(f'[USER] Berhasil fetch {len(USER_NAMES)} user: {USER_NAMES}')
+        else:
+            print(f'[USER] Gagal fetch user names: HTTP {res.status_code}')
+    except Exception as e:
+        print(f'[USER] Error fetch user names: {e}')
+
+def user_names_refresh_thread(interval=300):
+    """Refresh USER_NAMES setiap 5 menit (300 detik)"""
+    while True:
+        fetch_user_names()
+        time.sleep(interval)
+
+# ── Telegram ──────────────────────────────────────
+def send_telegram_photo(frame, caption):
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+        cv2.imwrite(tmp.name, frame)
+        tmp.close()
+
+        url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto'
+        with open(tmp.name, 'rb') as photo:
+            requests.post(url, data={
+                'chat_id'    : TELEGRAM_CHAT_ID,
+                'caption'    : caption,
+                'parse_mode' : 'HTML',
+            }, files={'photo': photo}, timeout=10)
+
+        os.unlink(tmp.name)
+    except Exception as e:
+        print(f'[TELEGRAM ERROR] {e}')
+
+# ── API ───────────────────────────────────────────
+def send_to_api(identifier, method, frame=None):
+    try:
+        res  = requests.post(API_URL, json={
+            'device_token': DEVICE_TOKEN,
+            'identifier'  : identifier,
+            'method'      : method,
+        }, timeout=5)
+        data   = res.json()
+        status = data.get('status')
+
+        if frame is not None:
+            from datetime import datetime
+            waktu = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+            if status == 'granted':
+                caption = (f"✅ <b>AKSES DITERIMA</b>\n\n"
+                          f"🚪 Pintu berhasil dibuka\n"
+                          f"📅 Waktu     : {waktu}\n"
+                          f"🔑 Identifier: {identifier}\n"
+                          f"📡 Metode    : FACE\n"
+                          f"📍 Device    : Raspberry Pi Smart Door")
+            else:
+                reason = data.get('reason', 'Tidak diketahui')
+                caption = (f"🚨 <b>PERINGATAN SMART DOOR</b>\n\n"
+                          f"❌ <b>Akses Ditolak!</b>\n"
+                          f"📅 Waktu     : {waktu}\n"
+                          f"🔑 Identifier: {identifier}\n"
+                          f"📡 Metode    : FACE\n"
+                          f"📍 Device    : Raspberry Pi Smart Door\n"
+                          f"⚠️ Alasan    : {reason}")
+
+            threading.Thread(
+                target=send_telegram_photo,
+                args=(frame.copy(), caption),
+                daemon=True
+            ).start()
+
+        return status
+    except Exception as e:
+        print(f'[API ERROR] {e}')
+        return None
+
+# ── Main Face Recognition ─────────────────────────
+def run():
+    if not os.path.exists(MODEL_PATH):
+        print('[ERROR] Model belum ada! Jalankan train_model.py dulu.')
+        sys.exit(1)
+
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.read(MODEL_PATH)
+
+    face_cascade = cv2.CascadeClassifier(HAAR)
+    if face_cascade.empty():
+        print('[ERROR] Haarcascade tidak ditemukan!')
+        sys.exit(1)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print('[ERROR] Webcam tidak bisa dibuka!')
+        sys.exit(1)
+
+    # Fetch user names pertama kali sebelum mulai
+    fetch_user_names()
+
+    # Refresh otomatis setiap 5 menit di background
+    threading.Thread(target=user_names_refresh_thread, args=(300,), daemon=True).start()
+
+    print('[INFO] Face recognition aktif. Tekan Q untuk keluar.')
+
+    last_sent   = {}
+    frame_count = 0
+    COOLDOWN    = 60
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+        for (x, y, w, h) in faces:
+            face_roi          = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+            label, confidence = recognizer.predict(face_roi)
+
+            if confidence < 70:
+                with USER_NAMES_LOCK:
+                    name = USER_NAMES.get(label, f'User {label}')
+                identifier = f'FACE-user_{label}'
+                color      = (0, 255, 0)
+                status     = f'{name} ({confidence:.0f})'
+            else:
+                name       = 'Tidak dikenal'
+                identifier = 'FACE-UNKNOWN'
+                color      = (0, 0, 255)
+                status     = f'Tidak dikenal ({confidence:.0f})'
+
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(frame, status, (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            key = identifier
+            if frame_count - last_sent.get(key, -COOLDOWN) >= COOLDOWN:
+                last_sent[key] = frame_count
+                print(f'\n[FACE] Terdeteksi: {name} (confidence: {confidence:.1f})')
+                threading.Thread(
+                    target=send_to_api,
+                    args=(identifier, 'face', frame),
+                    daemon=True
+                ).start()
+
+        cv2.putText(frame, 'Smart Door \u2014 Face Recognition',
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 229, 122), 2)
+        cv2.imshow('Smart Door \u2014 Face Recognition', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    run()

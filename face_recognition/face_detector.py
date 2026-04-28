@@ -4,22 +4,52 @@ import sys
 import requests
 import threading
 import tempfile
+import time
+from dotenv import load_dotenv
+
+# Load konfigurasi dari config.env
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.env'))
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 HAAR       = os.path.join(BASE_DIR, '..', 'haarcascade', 'haarcascade_frontalface_default.xml')
 MODEL_PATH = os.path.join(BASE_DIR, '..', 'models', 'face_recognition', 'face_model.yml')
-API_URL    = 'http://127.0.0.1:8000/api/door/unlock'
 
-TELEGRAM_TOKEN   = '8689794607:AAH-qZm2pPEuJTsodxHoQO8Xi3lpXItcs9I'
-TELEGRAM_CHAT_ID = '5438873362'
+API_URL      = os.getenv('API_URL', 'http://127.0.0.1:8000/api/door/unlock')
+API_BASE     = API_URL.replace('/api/door/unlock', '')
+DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', 'raspi-token-001')
 
-USER_NAMES = {
-    1: 'hardi',
-}
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
+# ── Fetch USER_NAMES dari Laravel ─────────────────
+USER_NAMES      = {}
+USER_NAMES_LOCK = threading.Lock()
+
+def fetch_user_names():
+    """Fetch daftar nama user dari Laravel API"""
+    global USER_NAMES
+    try:
+        res = requests.get(f'{API_BASE}/api/users/identifiers', timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            # Convert key dari string ke int: {"1": "hardi"} → {1: "hardi"}
+            with USER_NAMES_LOCK:
+                USER_NAMES = {int(k): v for k, v in data.items()}
+            print(f'[USER] Berhasil fetch {len(USER_NAMES)} user: {USER_NAMES}')
+        else:
+            print(f'[USER] Gagal fetch user names: HTTP {res.status_code}')
+    except Exception as e:
+        print(f'[USER] Error fetch user names: {e}')
+
+def user_names_refresh_thread(interval=300):
+    """Refresh USER_NAMES setiap 5 menit (300 detik)"""
+    while True:
+        fetch_user_names()
+        time.sleep(interval)
+
+# ── Telegram ──────────────────────────────────────
 def send_telegram_photo(frame, caption):
     try:
-        # Simpan frame ke file temporary
         tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
         cv2.imwrite(tmp.name, frame)
         tmp.close()
@@ -36,17 +66,17 @@ def send_telegram_photo(frame, caption):
     except Exception as e:
         print(f'[TELEGRAM ERROR] {e}')
 
+# ── API ───────────────────────────────────────────
 def send_to_api(identifier, method, frame=None):
     try:
         res  = requests.post(API_URL, json={
-            'device_token': 'raspi-token-001',
+            'device_token': DEVICE_TOKEN,
             'identifier'  : identifier,
             'method'      : method,
         }, timeout=5)
-        data = res.json()
+        data   = res.json()
         status = data.get('status')
 
-        # Kirim foto ke Telegram
         if frame is not None:
             from datetime import datetime
             waktu = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
@@ -55,7 +85,8 @@ def send_to_api(identifier, method, frame=None):
                           f"🚪 Pintu berhasil dibuka\n"
                           f"📅 Waktu     : {waktu}\n"
                           f"🔑 Identifier: {identifier}\n"
-                          f"📡 Metode    : FACE")
+                          f"📡 Metode    : FACE\n"
+                          f"📍 Device    : Raspberry Pi Smart Door")
             else:
                 reason = data.get('reason', 'Tidak diketahui')
                 caption = (f"🚨 <b>PERINGATAN SMART DOOR</b>\n\n"
@@ -63,6 +94,7 @@ def send_to_api(identifier, method, frame=None):
                           f"📅 Waktu     : {waktu}\n"
                           f"🔑 Identifier: {identifier}\n"
                           f"📡 Metode    : FACE\n"
+                          f"📍 Device    : Raspberry Pi Smart Door\n"
                           f"⚠️ Alasan    : {reason}")
 
             threading.Thread(
@@ -76,6 +108,7 @@ def send_to_api(identifier, method, frame=None):
         print(f'[API ERROR] {e}')
         return None
 
+# ── Main Face Recognition ─────────────────────────
 def run():
     if not os.path.exists(MODEL_PATH):
         print('[ERROR] Model belum ada! Jalankan train_model.py dulu.')
@@ -93,6 +126,12 @@ def run():
     if not cap.isOpened():
         print('[ERROR] Webcam tidak bisa dibuka!')
         sys.exit(1)
+
+    # Fetch user names pertama kali sebelum mulai
+    fetch_user_names()
+
+    # Refresh otomatis setiap 5 menit di background
+    threading.Thread(target=user_names_refresh_thread, args=(300,), daemon=True).start()
 
     print('[INFO] Face recognition aktif. Tekan Q untuk keluar.')
 
@@ -114,7 +153,8 @@ def run():
             label, confidence = recognizer.predict(face_roi)
 
             if confidence < 70:
-                name       = USER_NAMES.get(label, f'User {label}')
+                with USER_NAMES_LOCK:
+                    name = USER_NAMES.get(label, f'User {label}')
                 identifier = f'FACE-user_{label}'
                 color      = (0, 255, 0)
                 status     = f'{name} ({confidence:.0f})'
@@ -124,12 +164,10 @@ def run():
                 color      = (0, 0, 255)
                 status     = f'Tidak dikenal ({confidence:.0f})'
 
-            # Gambar kotak dulu sebelum capture
             cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
             cv2.putText(frame, status, (x, y-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-            # Kirim ke API + foto
             key = identifier
             if frame_count - last_sent.get(key, -COOLDOWN) >= COOLDOWN:
                 last_sent[key] = frame_count
@@ -140,9 +178,9 @@ def run():
                     daemon=True
                 ).start()
 
-        cv2.putText(frame, 'Smart Door — Face Recognition',
+        cv2.putText(frame, 'Smart Door \u2014 Face Recognition',
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 229, 122), 2)
-        cv2.imshow('Smart Door — Face Recognition', frame)
+        cv2.imshow('Smart Door \u2014 Face Recognition', frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
