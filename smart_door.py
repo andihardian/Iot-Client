@@ -3,12 +3,14 @@ import time
 import os
 import threading
 import tempfile
+import subprocess
 import cv2
 from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv('config.env')
 API_URL      = os.getenv('API_URL', 'http://127.0.0.1:8000/api/door/unlock')
+API_BASE     = API_URL.replace('/api/door/unlock', '')
 DEVICE_TOKEN = os.getenv('DEVICE_TOKEN', 'raspi-token-001')
 SIMULATE     = os.getenv('SIMULATE', 'true').lower() == 'true'
 
@@ -33,17 +35,30 @@ GPIO.setup(RELAY_PIN, GPIO.OUT)
 GPIO.output(RELAY_PIN, GPIO.HIGH)
 
 # ── Face Recognition Setup ────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-HAAR       = os.path.join(BASE_DIR, 'haarcascade', 'haarcascade_frontalface_default.xml')
-MODEL_PATH = os.path.join(BASE_DIR, 'models', 'face_recognition', 'face_model.yml')
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+HAAR         = os.path.join(BASE_DIR, 'haarcascade', 'haarcascade_frontalface_default.xml')
+MODEL_PATH   = os.path.join(BASE_DIR, 'models', 'face_recognition', 'face_model.yml')
+DATASET_DIR  = os.path.join(BASE_DIR, 'face_recognition', 'dataset')
+TRAIN_SCRIPT = os.path.join(BASE_DIR, 'face_recognition', 'train_model.py')
 
 USER_NAMES = {
     1: 'hardi',
     2: 'andi',
 }
 
-MAX_DENIED_NOTIF = 3
-ACCESS_GRANTED   = threading.Event()
+MAX_DENIED_NOTIF  = 3
+ACCESS_GRANTED    = threading.Event()
+REGISTRATION_LOCK = threading.Lock()
+IS_REGISTERING    = threading.Event()
+
+# ── Cek Setting Notifikasi dari Laravel ───────────
+def is_notif_enabled(type='granted'):
+    try:
+        res  = requests.get(f'{API_BASE}/api/settings/notifications', timeout=3)
+        data = res.json()
+        return data.get(type, True)
+    except:
+        return True  # default aktif jika gagal cek
 
 # ── Telegram ──────────────────────────────────────
 def send_telegram_photo(frame, caption):
@@ -78,7 +93,7 @@ def check_access(identifier, method='rfid', frame=None):
         if status == 'granted':
             print(f"[✅ GRANTED] {data['message']}")
             buka_pintu()
-            if frame is not None:
+            if frame is not None and is_notif_enabled('granted'):
                 caption = (f"✅ <b>AKSES DITERIMA</b>\n\n"
                           f"🚪 Pintu berhasil dibuka\n"
                           f"📅 Waktu     : {waktu}\n"
@@ -86,10 +101,12 @@ def check_access(identifier, method='rfid', frame=None):
                           f"📡 Metode    : {method.upper()}")
                 threading.Thread(target=send_telegram_photo,
                                  args=(frame.copy(), caption), daemon=True).start()
+            elif frame is not None:
+                print("[NOTIF] Notifikasi granted dinonaktifkan.")
         else:
             print(f"[❌ DENIED]  {data['message']}")
             tolak_akses()
-            if frame is not None:
+            if frame is not None and is_notif_enabled('denied'):
                 reason = data.get('reason', data.get('message', 'Tidak diketahui'))
                 caption = (f"🚨 <b>PERINGATAN SMART DOOR</b>\n\n"
                           f"❌ <b>Akses Ditolak!</b>\n"
@@ -99,6 +116,8 @@ def check_access(identifier, method='rfid', frame=None):
                           f"⚠️ Alasan    : {reason}")
                 threading.Thread(target=send_telegram_photo,
                                  args=(frame.copy(), caption), daemon=True).start()
+            elif frame is not None:
+                print("[NOTIF] Notifikasi denied dinonaktifkan.")
 
         return status == 'granted'
     except requests.exceptions.ConnectionError:
@@ -148,13 +167,29 @@ def face_recognition_thread():
     notif_denied  = 0
     frame_count   = 0
     COOLDOWN      = 60
+    last_mtime    = os.path.getmtime(MODEL_PATH)
 
     while True:
+        if IS_REGISTERING.is_set():
+            time.sleep(0.5)
+            continue
+
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_count += 1
+
+        # Reload model otomatis jika ada update
+        try:
+            mtime = os.path.getmtime(MODEL_PATH)
+            if mtime != last_mtime:
+                last_mtime = mtime
+                recognizer.read(MODEL_PATH)
+                print("[FACE] Model di-reload otomatis!")
+        except Exception:
+            pass
+
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
@@ -173,7 +208,7 @@ def face_recognition_thread():
 
                     if not notif_granted.get(label, False):
                         notif_granted[label] = True
-                        notif_denied = MAX_DENIED_NOTIF  # block denied
+                        notif_denied = MAX_DENIED_NOTIF
                         ACCESS_GRANTED.set()
                         print(f"\n[FACE] Terdeteksi: {name} (confidence: {confidence:.1f}) → notif dikirim")
                         threading.Thread(
@@ -220,6 +255,140 @@ def face_recognition_thread():
     cap.release()
     cv2.destroyAllWindows()
 
+# ── Face Registration Thread ──────────────────────
+def face_registration_thread():
+    print("[REG] Face registration thread aktif.")
+
+    while True:
+        time.sleep(5)
+        try:
+            res          = requests.get(f'{API_BASE}/api/face-requests/pending', timeout=3)
+            pending_list = res.json()
+
+            if not pending_list:
+                continue
+
+            for req in pending_list:
+                req_id  = req['id']
+                user_id = req['user_id']
+                name    = req['name']
+
+                print(f"\n[REG] Request pendaftaran: {name} (user_id: {user_id})")
+
+                IS_REGISTERING.set()
+                print("[REG] Face recognition dijeda...")
+                time.sleep(1)
+
+                with REGISTRATION_LOCK:
+                    try:
+                        requests.post(f'{API_BASE}/api/face-requests/{req_id}/processing', timeout=3)
+
+                        save_dir = os.path.join(DATASET_DIR, f'user_{user_id}')
+                        os.makedirs(save_dir, exist_ok=True)
+
+                        for f in os.listdir(save_dir):
+                            os.remove(os.path.join(save_dir, f))
+
+                        face_cascade = cv2.CascadeClassifier(HAAR)
+                        cap          = cv2.VideoCapture(0)
+
+                        if not cap.isOpened():
+                            print("[REG] Webcam tidak bisa dibuka!")
+                            requests.post(f'{API_BASE}/api/face-requests/{req_id}/failed', timeout=3)
+                            continue
+
+                        print(f"[REG] Mengambil 30 foto untuk {name}...")
+                        count         = 0
+                        attempts      = 0
+                        no_face_count = 0
+                        cancelled     = False
+
+                        while count < 30 and attempts < 500:
+                            if attempts % 20 == 0:
+                                try:
+                                    cr = requests.get(
+                                        f'{API_BASE}/api/face-requests/{req_id}/cancelled',
+                                        timeout=2
+                                    )
+                                    if cr.json().get('cancelled'):
+                                        print("[REG] Dibatalkan oleh user!")
+                                        cancelled = True
+                                        break
+                                except:
+                                    pass
+
+                            ret, frame = cap.read()
+                            attempts  += 1
+                            if not ret:
+                                continue
+
+                            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+                            if len(faces) == 0:
+                                no_face_count += 1
+                                if no_face_count % 30 == 0:
+                                    print("[REG] ⚠️ Tidak ada wajah terdeteksi")
+                                time.sleep(0.1)
+                                continue
+
+                            no_face_count = 0
+
+                            for (x, y, w, h) in faces:
+                                if w < 80 or h < 80:
+                                    print("[REG] ⚠️ Wajah terlalu kecil/jauh")
+                                    continue
+
+                                count   += 1
+                                face_img = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+                                cv2.imwrite(os.path.join(save_dir, f'{count}.jpg'), face_img)
+                                print(f"[REG] 📸 Foto {count}/30 tersimpan")
+
+                                try:
+                                    requests.post(
+                                        f'{API_BASE}/api/face-requests/{req_id}/progress',
+                                        json={'progress': count},
+                                        timeout=2
+                                    )
+                                except:
+                                    pass
+
+                            time.sleep(0.1)
+
+                        cap.release()
+
+                        if cancelled:
+                            continue
+
+                        if count < 10:
+                            print(f"[REG] Gagal — hanya {count} foto terkumpul")
+                            requests.post(f'{API_BASE}/api/face-requests/{req_id}/failed', timeout=3)
+                            continue
+
+                        print("[REG] Training model...")
+                        subprocess.run(['python', TRAIN_SCRIPT], check=True)
+
+                        USER_NAMES[user_id] = name
+                        print(f"[REG] USER_NAMES diupdate: {USER_NAMES}")
+
+                        requests.post(f'{API_BASE}/api/face-requests/{req_id}/done', timeout=3)
+                        print(f"[REG] ✅ {name} berhasil didaftarkan!")
+
+                    except Exception as e:
+                        print(f"[REG] Error: {e}")
+                        try:
+                            requests.post(f'{API_BASE}/api/face-requests/{req_id}/failed', timeout=3)
+                        except:
+                            pass
+
+                IS_REGISTERING.clear()
+                ACCESS_GRANTED.clear()
+                print("[REG] Face recognition aktif kembali.")
+
+        except Exception as e:
+            print(f'[REG ERROR] {e}')
+            IS_REGISTERING.clear()
+
 # ── Manual Input (RFID / PIN) ─────────────────────
 def manual_input_thread():
     print("\n" + "="*45)
@@ -249,8 +418,11 @@ def manual_input_thread():
 
 # ── Main ──────────────────────────────────────────
 if __name__ == "__main__":
-    t = threading.Thread(target=face_recognition_thread, daemon=True)
-    t.start()
+    t1 = threading.Thread(target=face_recognition_thread, daemon=True)
+    t1.start()
+
+    t2 = threading.Thread(target=face_registration_thread, daemon=True)
+    t2.start()
 
     manual_input_thread()
 
